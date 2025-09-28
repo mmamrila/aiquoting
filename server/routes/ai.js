@@ -4,9 +4,14 @@ const db = require('../database/db');
 const { v4: uuidv4 } = require('uuid');
 const productCompatibility = require('../utils/productCompatibility');
 const QuoteBuilder = require('../services/QuoteBuilder');
+const SafetyValidator = require('../middleware/SafetyValidator');
+const { getProductionMonitor } = require('../middleware/ProductionMonitor');
 
 // AI conversation handler
 router.post('/chat', async (req, res) => {
+  const startTime = Date.now();
+  const monitor = getProductionMonitor();
+
   let { message, session_id } = req.body;
 
   if (!message) {
@@ -25,6 +30,17 @@ router.post('/chat', async (req, res) => {
 
     storeInteraction(sessionId, message, response.message);
 
+    // Track successful quote generation if this was a quote request
+    if (response.actions && response.actions.some(a => a.type === 'quote_created')) {
+      const quoteAction = response.actions.find(a => a.type === 'quote_created');
+      monitor.trackQuoteGenerated({
+        totalAmount: quoteAction.data.total_amount,
+        userCount: quoteAction.data.user_count || 0,
+        systemType: quoteAction.data.system_type || 'Unknown',
+        isMultiSite: quoteAction.data.is_multi_site || false
+      }, Date.now() - startTime);
+    }
+
     res.json({
       session_id: sessionId,
       message: response.message,
@@ -34,6 +50,14 @@ router.post('/chat', async (req, res) => {
 
   } catch (error) {
     console.error('AI processing error:', error);
+
+    // Track system error
+    monitor.trackSystemError(error, {
+      message: message,
+      sessionId: sessionId,
+      endpoint: '/chat'
+    });
+
     res.status(500).json({
       error: 'Failed to process request',
       session_id: sessionId,
@@ -45,6 +69,25 @@ router.post('/chat', async (req, res) => {
 // Process user message and generate response
 async function processUserMessage(message, sessionId) {
   const lowerMessage = message.toLowerCase();
+
+  // GLOBAL SAFETY CHECK: Check for obviously unreasonable user counts in ANY message
+  const userCountMatches = message.match(/(\d+)\s*(?:users?|people|employees?|radios?)/gi);
+  if (userCountMatches) {
+    for (const match of userCountMatches) {
+      const userCount = parseInt(match.match(/(\d+)/)[1]);
+      if (userCount > 5000) {
+        console.log(`🚨 GLOBAL SAFETY: Detected unreasonable user count ${userCount} in message: "${message}"`);
+        return {
+          message: `⚠️ **Unreasonable User Count Detected**\n\nYour message mentions ${userCount.toLocaleString()} users/radios.\n\nFor deployments over 5,000 users, please contact our enterprise sales team for a custom consultation.\n\nMaximum users for online quoting: 5,000`,
+          suggestions: [
+            'Contact enterprise sales for large deployments',
+            'Verify the correct number of users needed',
+            'Consider multiple smaller deployments'
+          ]
+        };
+      }
+    }
+  }
 
   // ULTIMATE FIX: Direct string matching for your exact case
   if (message.includes('5 hospitals') && message.includes('40 users') && message.includes('talk to each other')) {
@@ -533,61 +576,8 @@ async function handleIndustryRequest(message, sessionId) {
                               lowerMessage.includes('get a quote');
 
   if (isFormalQuoteRequest) {
-    // Create formal quote using QuoteBuilder
-    try {
-      const quoteBuilder = new (require('../services/QuoteBuilder'))();
-
-      // Determine system type based on multi-site requirements
-      let systemType = 'Conventional';
-      if (multiSiteInfo.isMultiSite) {
-        if (userCount <= 250) {
-          systemType = 'IP Site Connect';
-        } else if (userCount <= 1500) {
-          systemType = 'Linked Capacity Plus';
-        } else {
-          systemType = 'Capacity Max';
-        }
-      } else if (userCount > 100) {
-        systemType = 'Capacity Plus';
-      } else if (userCount > 50) {
-        systemType = 'Capacity Plus';
-      }
-
-      const quote = await quoteBuilder.createMultiSiteQuote({
-        systemType,
-        userCount,
-        industry,
-        sessionId,
-        siteCount: multiSiteInfo.siteCount,
-        usersPerSite: multiSiteInfo.usersPerSite,
-        requiresInterSite: multiSiteInfo.requiresInterSite,
-        isMultiSite: multiSiteInfo.isMultiSite
-      });
-
-      const formattedQuote = quoteBuilder.formatQuoteForDisplay(quote);
-
-      return {
-        message: formattedQuote,
-        suggestions: [
-          'Modify this quote',
-          'Add more accessories',
-          'Create PDF version',
-          'Send quote to client'
-        ],
-        actions: [{
-          type: 'quote_created',
-          data: {
-            quote_id: quote.id,
-            quote_number: quote.quote_number,
-            total_amount: quote.total_amount,
-            client_name: quote.client_name
-          }
-        }]
-      };
-    } catch (error) {
-      console.error('Error creating formal quote in industry handler:', error.message);
-      // Fall through to estimation logic
-    }
+    // CRITICAL SAFETY CHECK: Use the centralized handleQuoteCreation with validation
+    return await handleQuoteCreation(message, sessionId);
   }
 
   try {
@@ -1013,6 +1003,68 @@ async function handleQuoteCreation(message, sessionId) {
     // Extract client info if provided
     const clientInfo = extractClientInfo(message);
 
+    // CRITICAL SAFETY CHECK: Validate quote before creation
+    const safetyValidator = new SafetyValidator();
+    const quoteData = {
+      systemType,
+      userCount,
+      industry,
+      siteCount: multiSiteInfo.siteCount,
+      usersPerSite: multiSiteInfo.usersPerSite,
+      requiresInterSite: multiSiteInfo.requiresInterSite,
+      isMultiSite: multiSiteInfo.isMultiSite,
+      totalAmount: 0 // Will be calculated
+    };
+
+    // CRITICAL PRE-VALIDATION: Check user count and basic sanity BEFORE building quote
+    if (userCount > 5000) {
+      console.log(`🚨 CRITICAL: User count ${userCount} exceeds maximum limit of 5000`);
+      return {
+        message: `⚠️ **User Count Exceeds Limit**\n\nRequested: ${userCount.toLocaleString()} users\nMaximum allowed: 5,000 users\n\nThis appears to be an unreasonable request. Please verify your requirements and try again with a realistic user count.`,
+        suggestions: [
+          'Verify the correct number of users needed',
+          'Contact support for large deployments >5,000 users',
+          'Consider breaking into multiple smaller quotes'
+        ]
+      };
+    }
+
+    // Estimate total cost for additional validation
+    const estimatedCostPerUser = 800; // Conservative estimate
+    const estimatedTotal = userCount * estimatedCostPerUser;
+
+    if (estimatedTotal > 2000000) {
+      console.log(`🚨 CRITICAL: Estimated quote total $${estimatedTotal.toLocaleString()} exceeds $2M limit`);
+      return {
+        message: `⚠️ **Quote Value Exceeds Reasonable Limits**\n\nEstimated total: $${estimatedTotal.toLocaleString()}\nUsers: ${userCount.toLocaleString()}\n\nThis quote exceeds our $2M threshold and requires executive approval. Please contact management for quotes of this magnitude.`,
+        suggestions: [
+          'Contact sales management for large quotes',
+          'Consider phased deployment approach',
+          'Verify user count requirements'
+        ]
+      };
+    }
+
+    // Pre-validation to catch obvious errors
+    const preValidation = safetyValidator.validateQuoteBeforeCreation(quoteData);
+
+    if (!preValidation.isValid) {
+      // Log the validation failure
+      safetyValidator.logValidationEvent(sessionId, quoteData, preValidation);
+      await safetyValidator.sendAlertIfNeeded(preValidation, quoteData);
+
+      // Return error message instead of bad quote
+      const errorMessages = preValidation.errors.map(e => e.message).join('\n');
+      return {
+        message: `⚠️ **Quote Validation Failed**\n\nThe following issues were detected:\n\n${errorMessages}\n\nPlease review your requirements and try again.`,
+        suggestions: [
+          'Check user count and site requirements',
+          'Verify system type is appropriate',
+          'Contact support if this seems incorrect'
+        ]
+      };
+    }
+
     const quoteBuilder = new QuoteBuilder();
 
     // Create formal quote based on system requirements (including multi-site)
@@ -1026,6 +1078,27 @@ async function handleQuoteCreation(message, sessionId) {
       requiresInterSite: multiSiteInfo.requiresInterSite,
       isMultiSite: multiSiteInfo.isMultiSite
     });
+
+    // POST-VALIDATION: Validate the calculated quote
+    quoteData.totalAmount = quote.total_amount;
+    const postValidation = safetyValidator.validateQuoteBeforeCreation(quoteData);
+
+    // Log all quote creation events
+    safetyValidator.logValidationEvent(sessionId, quoteData, postValidation);
+    await safetyValidator.sendAlertIfNeeded(postValidation, quoteData);
+
+    if (!postValidation.isValid) {
+      // Quote calculation produced invalid result
+      const errorMessages = postValidation.errors.map(e => e.message).join('\n');
+      return {
+        message: `⚠️ **Quote Calculation Error Detected**\n\nAmount: $${quote.total_amount.toLocaleString()}\nUsers: ${userCount}\n\nIssues:\n${errorMessages}\n\nThis quote requires manual review before proceeding.`,
+        suggestions: [
+          'Contact support for manual quote review',
+          'Try with different parameters',
+          'Request consultation'
+        ]
+      };
+    }
 
     // Format quote for display
     const formattedQuote = quoteBuilder.formatQuoteForDisplay(quote);
@@ -1110,5 +1183,32 @@ function storeQuoteInteraction(sessionId, userInput, quoteId) {
     }
   });
 }
+
+// Production monitoring endpoints
+router.get('/health', (req, res) => {
+  const monitor = getProductionMonitor();
+  const health = monitor.getHealthStatus();
+
+  res.json({
+    status: health.status,
+    uptime: health.uptime,
+    metrics: health.metrics,
+    errorRate: health.errorRate,
+    averageResponseTime: health.averageResponseTime,
+    timestamp: new Date().toISOString()
+  });
+});
+
+router.get('/readiness', (req, res) => {
+  const monitor = getProductionMonitor();
+  const readiness = monitor.getProductionReadiness();
+
+  res.json({
+    ready: readiness.ready,
+    checks: readiness.checks,
+    recommendation: readiness.recommendation,
+    timestamp: new Date().toISOString()
+  });
+});
 
 module.exports = router;
